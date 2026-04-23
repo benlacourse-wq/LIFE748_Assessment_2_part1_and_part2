@@ -1,0 +1,509 @@
+---
+title: "LIFE748 - ML and data analysis"
+author: "Ben LaCourse"
+format: html
+editor: visual
+---
+
+## Step 0: Load the required libraries
+
+```{r warning=FALSE, message=FALSE}
+
+
+
+library(DESeq2)          # Differential expression analysis
+library(ggplot2)         # Plotting
+library(EnhancedVolcano) # Volcano plots
+library(pheatmap)        # Heatmaps
+library(caret)           # Data partitioning and confusion matrices
+library(MASS)            # LDA
+library(e1071)           # SVM
+library(dplyr)           # Data manipulation
+library(tibble)          # Row names / tibble helpers
+library(knitr)           # Tables
+```
+
+If these packages are not already installed, they can be installed from CRAN or Bioconductor. To maximise reproducibility, it is also useful to record the R and package versions used when rendering the final document.
+
+```{r}
+set.seed(123)
+```
+
+## Step 1: Load the count matrix
+
+The first 25 samples are assumed to belong to Condition A and the next 25 to Condition B.
+
+```{r}
+counts <- read.csv("dataset_LIFE748_3.csv", row.names = 1, check.names = FALSE)
+
+colData <- data.frame(
+  row.names = colnames(counts),
+  Condition = factor(c(rep("CondA", 25), rep("CondB", 25)),
+                     levels = c("CondA", "CondB"))
+)
+
+# Basic checks
+cat("Number of genes:", nrow(counts), "\n")
+cat("Number of samples:", ncol(counts), "\n")
+table(colData$Condition)
+```
+
+## Step 2: Normalize and identify DEGs with DESeq2
+
+```{r}
+# Create DESeq2 dataset object
+dds <- DESeqDataSetFromMatrix(
+  countData = counts,
+  colData   = colData,
+  design    = ~ Condition
+)
+
+# Run DESeq2 pipeline
+dds <- DESeq(dds)
+
+# Extract DE results (Condition B vs Condition A)
+res <- results(dds, contrast = c("Condition", "CondB", "CondA"))
+
+# Variance-stabilised expression for downstream ML
+vsd <- vst(dds, blind = FALSE)
+normalized_counts <- assay(vsd)
+
+# Convert results to data frame
+res_df <- as.data.frame(res) %>%
+  rownames_to_column("Gene") %>%
+  filter(!is.na(padj)) %>%
+  arrange(padj)
+
+# Add average expression by condition for interpretation
+res_df <- res_df %>%
+  mutate(
+    mean_CondA = rowMeans(normalized_counts[Gene, colData$Condition == "CondA", drop = FALSE]),
+    mean_CondB = rowMeans(normalized_counts[Gene, colData$Condition == "CondB", drop = FALSE]),
+    direction = ifelse(log2FoldChange > 0, "Higher in CondB", "Higher in CondA")
+  )
+
+# Overview of DE results
+summary(res)
+```
+
+## Step 3: Report DEGs (table and volcano plot)
+
+Statistically significant DEGs are defined here as genes with adjusted *p* value \< 0.05 and absolute log2 fold change \> 1.
+
+```{r}
+# Stringent DEG definition for reporting
+sig_deg <- res_df %>%
+  filter(padj < 0.05, abs(log2FoldChange) > 1) %>%
+  arrange(padj)
+
+cat("Number of significant DEGs (padj < 0.05 and |log2FC| > 1):", nrow(sig_deg), "\n")
+
+# Table of top DEGs for the report
+sig_deg_table <- sig_deg %>%
+  select(Gene, log2FoldChange, lfcSE, stat, pvalue, padj, mean_CondA, mean_CondB, direction) %>%
+  slice_head(n = 20)
+
+kable(sig_deg_table, digits = 3,
+      caption = "Top 20 significant differentially expressed genes ranked by adjusted p-value.")
+
+# Save full DEG table for supplementary output
+write.csv(sig_deg, "DEG_table_stringent.csv", row.names = FALSE)
+```
+
+Generate a volcano plot to visualise the results.
+
+```{r fig.width=9, fig.height=7}
+EnhancedVolcano(
+  res_df,
+  lab = res_df$Gene,
+  x = "log2FoldChange",
+  y = "padj",
+  pCutoff = 0.05,
+  FCcutoff = 1,
+  pointSize = 2.0,
+  labSize = 3.0,
+  title = "Volcano plot: Condition B vs Condition A",
+  subtitle = "DESeq2 differential expression results",
+  caption = "Significant DEGs satisfy padj < 0.05 and |log2FC| > 1"
+)
+```
+
+## Step 4: Isolate differentially expressed genes
+
+```{r}
+# Relaxed DEG threshold for clustering / classification
+relaxed_deg <- res_df %>%
+  filter(padj < 0.10, abs(log2FoldChange) > 0.5) %>%
+  arrange(padj)
+
+cat("Number of relaxed DEGs (padj < 0.10 and |log2FC| > 0.5):", nrow(relaxed_deg), "\n")
+
+# Extract relaxed DEG expression matrix
+deg_genes  <- relaxed_deg$Gene
+deg_counts <- normalized_counts[deg_genes, , drop = FALSE]
+
+cat("Dimensions of DEG-only expression matrix:", nrow(deg_counts), "genes x", ncol(deg_counts), "samples\n")
+
+write.csv(deg_counts, "DEG_normalized_counts_relaxed.csv")
+```
+
+## Step 5: Unsupervised clustering
+
+```{r}
+# Transpose so rows = samples, columns = genes
+deg_counts_t <- t(deg_counts)
+
+# Standardise gene-wise for clustering and PCA
+deg_counts_scaled <- scale(deg_counts_t)
+
+# Remove any zero-variance columns that may break distance calculations
+nzv <- apply(deg_counts_scaled, 2, sd, na.rm = TRUE) > 0
+deg_counts_scaled <- deg_counts_scaled[, nzv, drop = FALSE]
+
+cat("Number of relaxed DEGs retained after removing zero-variance features:", ncol(deg_counts_scaled), "\n")
+```
+
+### k-means clustering
+
+```{r}
+set.seed(123)
+km <- kmeans(deg_counts_scaled, centers = 2, nstart = 50)
+
+km_table <- table(Cluster = km$cluster, Condition = colData$Condition)
+km_table
+
+# Because k-means cluster labels are arbitrary, compute the best possible mapping accuracy
+km_acc_1 <- sum(diag(km_table)) / sum(km_table)
+km_acc_2 <- (km_table[1,2] + km_table[2,1]) / sum(km_table)
+km_best_accuracy <- max(km_acc_1, km_acc_2)
+
+cat("Best-mapped k-means clustering accuracy:", round(km_best_accuracy, 3), "\n")
+```
+
+### Hierarchical clustering
+
+```{r fig.width=9, fig.height=6}
+sample_dist <- dist(deg_counts_scaled, method = "euclidean")
+hc <- hclust(sample_dist, method = "ward.D2")
+
+plot(hc,
+     labels = rownames(deg_counts_scaled),
+     main = "Hierarchical clustering of samples",
+     xlab = "",
+     sub = "Ward.D2 linkage on scaled DEG expression",
+     cex = 0.75)
+rect.hclust(hc, k = 2, border = "red")
+```
+
+### Heatmap visualisation
+
+```{r fig.width=10, fig.height=10}
+annotation_col <- data.frame(
+  Condition = colData$Condition,
+  KmeansCluster = factor(km$cluster)
+)
+rownames(annotation_col) <- rownames(colData)
+
+pheatmap(
+  t(scale(t(deg_counts))),
+  annotation_col = annotation_col,
+  show_rownames = FALSE,
+  show_colnames = FALSE,
+  clustering_method = "ward.D2",
+  main = "Heatmap of relaxed DEGs across samples"
+)
+```
+
+### PCA for low-dimensional visualisation
+
+```{r fig.width=8, fig.height=6}
+pca <- prcomp(deg_counts_scaled, center = TRUE, scale. = FALSE)
+
+pca_df <- data.frame(
+  Sample = rownames(deg_counts_scaled),
+  Condition = colData$Condition,
+  Cluster = factor(km$cluster),
+  PC1 = pca$x[, 1],
+  PC2 = pca$x[, 2]
+)
+
+pc_var <- summary(pca)$importance[2, 1:2] * 100
+
+ggplot(pca_df, aes(PC1, PC2, color = Condition, shape = Cluster)) +
+  geom_point(size = 3) +
+  theme_minimal() +
+  labs(
+    title = "PCA of samples using relaxed DEGs",
+    x = paste0("PC1 (", round(pc_var[1], 1), "%)"),
+    y = paste0("PC2 (", round(pc_var[2], 1), "%)")
+  )
+```
+
+## Step 6: Supervised learning (logistic regression, LDA and SVM)
+
+```{r}
+# Prepare ML dataset: rows = samples, columns = genes
+ml_data <- as.data.frame(t(deg_counts))
+ml_data$Condition <- factor(colData$Condition, levels = c("CondB", "CondA"))
+
+# Stratified split
+set.seed(46)
+train_index <- createDataPartition(ml_data$Condition, p = 0.70, list = FALSE)
+train_data <- ml_data[train_index, ]
+test_data  <- ml_data[-train_index, ]
+
+cat("Training samples:", nrow(train_data), "\n")
+cat("Testing samples:", nrow(test_data), "\n")
+
+# Feature selection using training data only
+x_train_all <- train_data[, setdiff(colnames(train_data), "Condition"), drop = FALSE]
+feature_var <- apply(x_train_all, 2, var)
+feature_var <- sort(feature_var, decreasing = TRUE)
+
+# Keep a manageable number of highly variable genes
+n_features <- min(20, length(feature_var))
+selected_features <- names(feature_var)[1:n_features]
+
+cat("Number of features used for supervised learning:", length(selected_features), "\n")
+print(selected_features)
+
+# Build scaled training and test matrices using identical scaling parameters
+train_x <- scale(train_data[, selected_features, drop = FALSE])
+train_center <- attr(train_x, "scaled:center")
+train_scale  <- attr(train_x, "scaled:scale")
+
+test_x <- scale(test_data[, selected_features, drop = FALSE],
+                center = train_center,
+                scale = train_scale)
+
+train_model_data <- data.frame(as.data.frame(train_x), Condition = train_data$Condition)
+test_model_data  <- data.frame(as.data.frame(test_x),  Condition = test_data$Condition)
+```
+
+### Train logistic regression
+
+```{r}
+glm_model <- glm(Condition ~ ., data = train_model_data, family = binomial)
+
+glm_prob <- predict(glm_model, newdata = test_model_data, type = "response")
+glm_class <- ifelse(glm_prob > 0.5, "CondA", "CondB")
+glm_class <- factor(glm_class, levels = levels(test_model_data$Condition))
+```
+
+### Train LDA (Linear Discriminant Analysis)
+
+```{r}
+lda_model <- lda(Condition ~ ., data = train_model_data)
+lda_pred  <- predict(lda_model, newdata = test_model_data)
+lda_class <- lda_pred$class
+
+plot(lda_model)
+```
+
+### Train SVM (Support Vector Machine)
+
+```{r}
+svm_model <- svm(
+  Condition ~ ., 
+  data = train_model_data,
+  kernel = "linear",
+  scale = FALSE,
+  probability = TRUE
+)
+
+svm_class <- predict(svm_model, newdata = test_model_data)
+plot(svm_class)
+```
+
+## Step 7: Compare classifier performance
+
+Performance is evaluated on the unseen test set using confusion matrices and summary metrics.
+
+```{r}
+# Helper function to extract metrics from confusion matrices
+extract_metrics <- function(cm, model_name) {
+  data.frame(
+    Model = model_name,
+    Accuracy = unname(cm$overall["Accuracy"]),
+    Kappa = unname(cm$overall["Kappa"]),
+    Sensitivity = unname(cm$byClass["Sensitivity"]),
+    Specificity = unname(cm$byClass["Specificity"]),
+    BalancedAccuracy = unname(cm$byClass["Balanced Accuracy"]),
+    Precision = unname(cm$byClass["Pos Pred Value"]),
+    Recall = unname(cm$byClass["Sensitivity"]),
+    F1 = unname(cm$byClass["F1"])
+  )
+}
+
+true_labels <- test_model_data$Condition
+
+glm_cm <- confusionMatrix(glm_class, true_labels, positive = "CondB")
+lda_cm <- confusionMatrix(lda_class, true_labels, positive = "CondB")
+svm_cm <- confusionMatrix(svm_class, true_labels, positive = "CondB")
+
+glm_cm
+lda_cm
+svm_cm
+```
+
+```{r}
+performance_summary <- bind_rows(
+  extract_metrics(glm_cm, "Logistic regression"),
+  extract_metrics(lda_cm, "LDA"),
+  extract_metrics(svm_cm, "Linear SVM")
+)
+
+kable(performance_summary, digits = 3,
+      caption = "Held-out test set performance for the three classifiers.")
+```
+
+## Step 8: Is this enough? Cross-validation and robustness analysis
+
+```{r}
+# Helper to create metrics from predictions
+metric_from_preds <- function(pred, truth, model_name, positive = "CondB") {
+  cm <- confusionMatrix(pred, truth, positive = positive)
+  data.frame(
+    Model = model_name,
+    Accuracy = unname(cm$overall["Accuracy"]),
+    Kappa = unname(cm$overall["Kappa"]),
+    Sensitivity = unname(cm$byClass["Sensitivity"]),
+    Specificity = unname(cm$byClass["Specificity"]),
+    BalancedAccuracy = unname(cm$byClass["Balanced Accuracy"])
+  )
+}
+
+set.seed(123)
+folds <- createMultiFolds(ml_data$Condition, k = 5, times = 10)
+
+cv_results <- list()
+selected_gene_log <- list()
+
+for (i in seq_along(folds)) {
+  fold_train_index <- folds[[i]]
+  fold_train <- ml_data[fold_train_index, , drop = FALSE]
+  fold_test  <- ml_data[-fold_train_index, , drop = FALSE]
+  
+  # Training-only feature selection within each fold
+  fold_x <- fold_train[, setdiff(colnames(fold_train), "Condition"), drop = FALSE]
+  fold_var <- sort(apply(fold_x, 2, var), decreasing = TRUE)
+  fold_n_features <- min(10, length(fold_var))
+  fold_features <- names(fold_var)[1:fold_n_features]
+  selected_gene_log[[i]] <- data.frame(Resample = names(folds)[i], Gene = fold_features)
+  
+  # Scale using fold training statistics only
+  fold_train_x <- scale(fold_train[, fold_features, drop = FALSE])
+  fold_center <- attr(fold_train_x, "scaled:center")
+  fold_scale  <- attr(fold_train_x, "scaled:scale")
+  
+  fold_test_x <- scale(fold_test[, fold_features, drop = FALSE],
+                       center = fold_center,
+                       scale = fold_scale)
+  
+  fold_train_df <- data.frame(as.data.frame(fold_train_x), Condition = fold_train$Condition)
+  fold_test_df  <- data.frame(as.data.frame(fold_test_x),  Condition = fold_test$Condition)
+  
+  # Logistic regression
+  glm_fit <- glm(Condition ~ ., data = fold_train_df, family = binomial)
+  glm_prob <- predict(glm_fit, newdata = fold_test_df, type = "response")
+  glm_pred <- ifelse(glm_prob > 0.5, "CondA", "CondB")
+  glm_pred <- factor(glm_pred, levels = levels(fold_test_df$Condition))
+  
+  # LDA
+  lda_fit <- lda(Condition ~ ., data = fold_train_df)
+  lda_pred <- predict(lda_fit, newdata = fold_test_df)$class
+  
+  # SVM
+  svm_fit <- svm(Condition ~ ., data = fold_train_df, kernel = "linear", scale = FALSE)
+  svm_pred <- predict(svm_fit, newdata = fold_test_df)
+  
+  # Store results
+  cv_results[[length(cv_results) + 1]] <- metric_from_preds(glm_pred, fold_test_df$Condition, "Logistic regression")
+  cv_results[[length(cv_results) + 1]] <- metric_from_preds(lda_pred, fold_test_df$Condition, "LDA")
+  cv_results[[length(cv_results) + 1]] <- metric_from_preds(svm_pred, fold_test_df$Condition, "Linear SVM")
+}
+
+cv_results_df <- bind_rows(cv_results)
+selected_gene_df <- bind_rows(selected_gene_log)
+```
+
+```{r}
+cv_summary <- cv_results_df %>%
+  group_by(Model) %>%
+  summarise(
+    Mean_Accuracy = mean(Accuracy, na.rm = TRUE),
+    SD_Accuracy = sd(Accuracy, na.rm = TRUE),
+    Mean_Sensitivity = mean(Sensitivity, na.rm = TRUE),
+    Mean_Specificity = mean(Specificity, na.rm = TRUE),
+    Mean_BalancedAccuracy = mean(BalancedAccuracy, na.rm = TRUE),
+    Mean_Kappa = mean(Kappa, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+kable(cv_summary, digits = 3,
+      caption = "Repeated 5-fold cross-validation performance summary.")
+```
+
+```{r fig.width=8, fig.height=6}
+ggplot(cv_results_df, aes(x = Model, y = Accuracy)) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(title = "Cross-validated accuracy across repeated resamples",
+       x = "Classifier",
+       y = "Accuracy")
+```
+
+## Biologically informative markers
+
+To identify the most informative genes, differential expression evidence is combined with resampling-based feature selection frequency. Genes that are strongly differentially expressed and are repeatedly selected across cross-validation folds are more credible candidate markers than genes identified by only one method.
+
+```{r}
+# Frequency with which each gene was selected during cross-validation
+selection_frequency <- selected_gene_df %>%
+  count(Gene, sort = TRUE, name = "SelectionCount")
+
+# Combine with DE statistics
+marker_table <- selection_frequency %>%
+  left_join(
+    res_df %>% select(Gene, log2FoldChange, padj, mean_CondA, mean_CondB, direction),
+    by = "Gene"
+  ) %>%
+  mutate(
+    MeanDifference = mean_CondB - mean_CondA,
+    AbsLog2FC = abs(log2FoldChange)
+  ) %>%
+  arrange(desc(SelectionCount), padj, desc(AbsLog2FC))
+
+kable(head(marker_table, 20), digits = 3,
+      caption = "Top candidate marker genes ranked by cross-validation selection frequency and supported by differential expression statistics.")
+
+write.csv(marker_table, "candidate_marker_genes.csv", row.names = FALSE)
+```
+
+```{r}
+# Optional: visualise the top marker genes
+plot_markers <- head(marker_table$Gene, 15)
+marker_plot_df <- res_df %>%
+  filter(Gene %in% plot_markers) %>%
+  mutate(Gene = reorder(Gene, log2FoldChange))
+
+ggplot(marker_plot_df, aes(x = Gene, y = log2FoldChange, fill = direction)) +
+  geom_col() +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "Top candidate marker genes",
+       x = "Gene",
+       y = "log2 fold change (CondB vs CondA)")
+```
+
+## Reproducibility outputs
+
+```{r}
+# Save key objects used in the analysis
+write.csv(res_df, "DESeq2_all_results.csv", row.names = FALSE)
+write.csv(performance_summary, "heldout_model_performance.csv", row.names = FALSE)
+write.csv(cv_summary, "cross_validation_summary.csv", row.names = FALSE)
+write.csv(selected_gene_df, "cv_selected_genes_by_resample.csv", row.names = FALSE)
+
+sessionInfo()
+```

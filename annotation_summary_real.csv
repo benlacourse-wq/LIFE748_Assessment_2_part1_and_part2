@@ -1,0 +1,3 @@
+assembler,annotator,total_bp,n_contigs,n_CDS,n_rRNA,n_tRNA,frac_function,runtime_min
+Flye,Prokka,5320437,4,5029,22,95,0.7544243388347585,8.666666666666666
+Flye,Bakta,5320437,4,5023,22,93,0.9384829782998209,

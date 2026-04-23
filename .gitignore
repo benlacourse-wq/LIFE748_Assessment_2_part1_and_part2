@@ -1,0 +1,7 @@
+*.fastq
+*.fq
+annotations/
+assemblies/
+qc/
+quast/
+logs/
